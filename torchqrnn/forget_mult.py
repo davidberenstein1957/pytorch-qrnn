@@ -92,17 +92,17 @@ class CPUForgetMult(torch.nn.Module):
 
 
 class GPUForgetMult(torch.autograd.Function):
-    configured_gpus = {}
-    ptx = None
     def __init__(self):
         super(GPUForgetMult, self).__init__()
-
-    def compile(self):
+    @staticmethod
+    def forward(self, f, x, hidden_init=None):
+        self.configured_gpus = {}
+        self.ptx = None
         if self.ptx is None:
-            program = Program(kernel.encode(), 'recurrent_forget_mult.cu'.encode())
-            GPUForgetMult.ptx = program.compile()
+            program = Program(kernel, 'recurrent_forget_mult.cu')
+            self.ptx = program.compile()
 
-        if torch.cuda.current_device() not in GPUForgetMult.configured_gpus:
+        if torch.cuda.current_device() not in self.configured_gpus:
             m = function.Module()
             m.load(bytes(self.ptx.encode()))
 
@@ -112,12 +112,10 @@ class GPUForgetMult(torch.autograd.Function):
             Stream = namedtuple('Stream', ['ptr'])
             self.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
 
-            GPUForgetMult.configured_gpus[torch.cuda.current_device()] = (self.forget_mult, self.bwd_forget_mult, self.stream)
+            self.configured_gpus[torch.cuda.current_device()] = (self.forget_mult, self.bwd_forget_mult, self.stream)
 
-        self.forget_mult, self.bwd_forget_mult, self.stream = GPUForgetMult.configured_gpus[torch.cuda.current_device()]
-
-    def forward(self, f, x, hidden_init=None):
-        self.compile()
+        self.forget_mult, self.bwd_forget_mult, self.stream = self.configured_gpus[torch.cuda.current_device()]
+#        self.compile()
         seq_size, batch_size, hidden_size = f.size()
         result = f.new(seq_size + 1, batch_size, hidden_size)
         # We only zero the result array (result[0]) if we don't set a hidden initial state
@@ -131,9 +129,28 @@ class GPUForgetMult(torch.autograd.Function):
         self.save_for_backward(f, x, hidden_init)
         self.result = result
         return result[1:, :, :]
-
+    @staticmethod
     def backward(self, grad_h):
-        self.compile()
+        self.configured_gpus = {}
+        self.ptx = None
+        if self.ptx is None:
+            program = Program(kernel, 'recurrent_forget_mult.cu')
+            self.ptx = program.compile()
+
+        if torch.cuda.current_device() not in self.configured_gpus:
+            m = function.Module()
+            m.load(bytes(self.ptx.encode()))
+
+            self.forget_mult = m.get_function('recurrent_forget_mult')
+            self.bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
+
+            Stream = namedtuple('Stream', ['ptr'])
+            self.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+
+            self.configured_gpus[torch.cuda.current_device()] = (self.forget_mult, self.bwd_forget_mult, self.stream)
+
+        self.forget_mult, self.bwd_forget_mult, self.stream = self.configured_gpus[torch.cuda.current_device()]
+#        self.compile()
         f, x, hidden_init = self.saved_tensors
         h = self.result
         ###
